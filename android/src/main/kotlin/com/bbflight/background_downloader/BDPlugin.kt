@@ -4,13 +4,17 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.job.JobInfo
 import android.app.job.JobScheduler
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.PersistableBundle
+import android.os.UserManager
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.preference.PreferenceManager
 import androidx.work.Constraints
@@ -34,6 +38,7 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import io.flutter.plugin.common.PluginRegistry
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -516,6 +521,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     private lateinit var mainScope: CoroutineScope
     private lateinit var defaultScope: CoroutineScope
     private var binaryMessenger: BinaryMessenger? = null
+    private var userUnlockedReceiver: BroadcastReceiver? = null
     var activity: Activity? = null
 
 
@@ -544,6 +550,48 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             "com.bbflight.background_downloader.uriutils"
         )
         uriUtilsChannel.setMethodCallHandler(UriUtilsMethodCallHelper(this))
+        initializeWhenUserUnlocked()
+    }
+
+    /**
+     * Initializes state backed by credential-encrypted storage once it is available.
+     */
+    private fun initializeWhenUserUnlocked() {
+        if (isUserUnlocked()) {
+            initializePluginState()
+            return
+        }
+
+        requireWifi = RequireWiFi.asSetByTask
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == Intent.ACTION_USER_UNLOCKED) {
+                    unregisterUserUnlockedReceiver()
+                    initializePluginState()
+                }
+            }
+        }
+        userUnlockedReceiver = receiver
+        ContextCompat.registerReceiver(
+            applicationContext,
+            receiver,
+            IntentFilter(Intent.ACTION_USER_UNLOCKED),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+
+        // Avoid missing the broadcast if the user unlocked between the first check
+        // and receiver registration.
+        if (isUserUnlocked()) {
+            unregisterUserUnlockedReceiver()
+            initializePluginState()
+        }
+    }
+
+    private fun isUserUnlocked(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.N ||
+                applicationContext.getSystemService(UserManager::class.java).isUserUnlocked
+
+    private fun initializePluginState() {
         val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         requireWifi = RequireWiFi.entries[prefs.getInt(keyRequireWiFi, 0)]
         // clear expired items - moved off the main thread because
@@ -552,18 +600,31 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         // (especially after the Flutter Great Thread Merge where plugin
         // callbacks run on Main).
         defaultScope.launch {
-            val workManager = WorkManager.getInstance(applicationContext)
-            val allWorkInfos = withContext(Dispatchers.IO) {
-                workManager.getWorkInfosByTag(TAG).get()
-            }
-            if (allWorkInfos.isEmpty()) {
-                prefsLock.write {
-                    // remove persistent storage if no jobs found at all
-                    prefs.edit {
-                        remove(keyTasksMap)
+            try {
+                val workManager = WorkManager.getInstance(applicationContext)
+                val allWorkInfos = withContext(Dispatchers.IO) {
+                    workManager.getWorkInfosByTag(TAG).get()
+                }
+                if (allWorkInfos.isEmpty()) {
+                    prefsLock.write {
+                        // remove persistent storage if no jobs found at all
+                        prefs.edit {
+                            remove(keyTasksMap)
+                        }
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "WorkManager is not available during plugin initialization", e)
             }
+        }
+    }
+
+    private fun unregisterUserUnlockedReceiver() {
+        userUnlockedReceiver?.let {
+            applicationContext.unregisterReceiver(it)
+            userUnlockedReceiver = null
         }
     }
 
@@ -575,6 +636,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * BackgroundChannel is set to null, and references to it removed if it no longer in use anywhere
      * */
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        unregisterUserUnlockedReceiver()
         mainScope.cancel()
         defaultScope.cancel()
         channel?.setMethodCallHandler(null)
