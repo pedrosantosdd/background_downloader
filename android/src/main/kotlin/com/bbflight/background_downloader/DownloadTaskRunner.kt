@@ -142,9 +142,12 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 if (applicationSupportPath == null || cachePath == null) {
                     throw IllegalStateException("External storage is requested but not available")
                 }
-                val tempDir =
-                    when (PreferenceManager.getDefaultSharedPreferences(context.appContext)
-                        .getInt(BDPlugin.keyConfigUseCacheDir, -2)) {
+                val sharedPrefs = PreferenceManager.getDefaultSharedPreferences(context.appContext)
+                val tempFilePathConfig = sharedPrefs.getString(BDPlugin.keyConfigTempFilePath, null)
+                val tempDir = if (!tempFilePathConfig.isNullOrEmpty()) {
+                    File(tempFilePathConfig)
+                } else {
+                    when (sharedPrefs.getInt(BDPlugin.keyConfigUseCacheDir, -2)) {
                         0 -> File(cachePath) // 'always'
                         -1 -> File(applicationSupportPath) // 'never'
                         else -> {
@@ -165,6 +168,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                             )
                         }
                     }
+                }
                 if (!tempDir.exists()) {
                     tempDir.mkdirs()
                 }
@@ -267,11 +271,18 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                             withContext(Dispatchers.IO) {
-                                Files.move(
-                                    tempFile.toPath(),
-                                    destFile.toPath(),
-                                    StandardCopyOption.REPLACE_EXISTING
-                                )
+                                try {
+                                    Files.move(
+                                        tempFile.toPath(),
+                                        destFile.toPath(),
+                                        StandardCopyOption.REPLACE_EXISTING
+                                    )
+                                } catch (e: java.nio.file.FileSystemException) {
+                                    // Fallback if moving across different filesystems/mount points (EXDEV / Cross-device link)
+                                    Log.d(TAG, "Files.move failed ($e), falling back to copyTo + delete")
+                                    tempFile.copyTo(destFile, overwrite = true)
+                                    deleteTempFile()
+                                }
                             }
                             setFileOwnership(destFile)
                         } else {
@@ -339,13 +350,22 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                             "Task ${task.taskId} paused due to timeout, will resume in 1 second"
                         )
                         val start = bytesTotal + startByte
-                        BDPlugin.doEnqueue(
+                        val success = BDPlugin.doEnqueue(
                             context.appContext,
                             task,
                             notificationConfigJsonString,
                             ResumeData(task, tempFilePath, start, eTagHeader),
                             1000
                         )
+                        if (!success) {
+                            Log.w(TAG, "Task ${task.taskId} timed out and could not re-enqueue to resume")
+                            taskException = TaskException(
+                                ExceptionType.general,
+                                description = "Task timed out and could not re-enqueue to resume"
+                            )
+                            cleanup(usesUri, destUri)
+                            return TaskStatus.failed
+                        }
                         return TaskStatus.paused
                     }
                     Log.i(TAG, "Task ${task.taskId} timed out and cannot pause/resume")

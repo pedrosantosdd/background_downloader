@@ -74,7 +74,13 @@ interface class FileDownloader {
   Future<bool> get ready => _downloader.ready;
 
   /// Stream of [TaskUpdate] updates for downloads that do
-  /// not have a registered callback
+  /// not have a registered callback.
+  ///
+  /// **Important**: This is a single-subscription stream. It can only be listened to
+  /// once. If you are developing a package or plugin, you should **not** listen
+  /// to this stream, as doing so will prevent the main application from listening to it.
+  /// Instead, use [registerCallbacks] with a custom group to monitor tasks specific
+  /// to your package.
   Stream<TaskUpdate> get updates => _downloader.updates.stream;
 
   /// Accesses utilities for working with URIs. URIs make working with file pickers and
@@ -135,6 +141,12 @@ interface class FileDownloader {
   /// appropriate callbacks are called for that group.
   /// For the `taskNotificationTapCallback` callback, the `defaultGroup` callback
   /// is used when calling 'convenience' functions like `FileDownloader().download`
+  ///
+  /// **Important for package developers**: Tasks belonging to a group that has
+  /// registered callbacks will **not** emit updates to the [updates] stream.
+  /// This makes [registerCallbacks] the preferred way for packages to monitor
+  /// their own tasks, as it avoids interfering with the main application's
+  /// single-subscription listener on the [updates] stream.
   ///
   /// The call returns the [FileDownloader] to make chaining easier
   FileDownloader registerCallbacks({
@@ -796,13 +808,26 @@ interface class FileDownloader {
   /// Set WiFi requirement globally, based on [requirement].
   ///
   /// Affects future tasks and reschedules enqueued, inactive tasks
-  /// with the new setting.
-  /// Reschedules running tasks if [rescheduleRunningTasks] is true,
-  /// otherwise leaves those running with their prior setting
+  /// (both downloads and uploads) with the new setting.
+  /// Reschedules running download tasks if [rescheduleRunningTasks] is true,
+  /// otherwise leaves those running with their prior setting.
+  /// Restarts running upload tasks if [alsoRestartUploads] is true (which
+  /// requires [rescheduleRunningTasks] to be true as well).
   Future<bool> requireWiFi(
     RequireWiFi requirement, {
     final rescheduleRunningTasks = true,
-  }) => _downloader.requireWiFi(requirement, rescheduleRunningTasks);
+    final alsoRestartUploads = false,
+  }) {
+    assert(
+      !(alsoRestartUploads && !rescheduleRunningTasks),
+      'alsoRestartUploads can only be set if rescheduleRunningTasks is true',
+    );
+    return _downloader.requireWiFi(
+      requirement,
+      rescheduleRunningTasks,
+      alsoRestartUploads,
+    );
+  }
 
   /// Returns the current global setting for requiring WiFi
   Future<RequireWiFi> getRequireWiFiSetting() =>
@@ -1054,6 +1079,7 @@ interface class FileDownloader {
     DesktopDownloader.requestTimeout,
     DesktopDownloader.proxy,
     DesktopDownloader.bypassTLSCertificateValidation,
+    DesktopDownloader.mtlsConfigs,
   ));
 
   /// Move the file represented by the [task] to a shared storage
@@ -1175,10 +1201,15 @@ interface class FileDownloader {
 /// This function is run on an Isolate to ensure performance on the main
 /// Isolate is not affected
 Future<http.Response> _doRequest(
-  (Request, Duration?, Map<String, dynamic>, bool) params,
+  (Request, Duration?, Map<String, dynamic>, bool, List<MTLSConfig>) params,
 ) async {
-  final (request, requestTimeout, proxy, bypassTLSCertificateValidation) =
-      params;
+  final (
+    request,
+    requestTimeout,
+    proxy,
+    bypassTLSCertificateValidation,
+    mtlsConfigs,
+  ) = params;
   Logger.root.level = Level.ALL;
   Logger.root.onRecord.listen((LogRecord rec) {
     if (kDebugMode) {
@@ -1190,8 +1221,9 @@ Future<http.Response> _doRequest(
     requestTimeout,
     proxy,
     bypassTLSCertificateValidation,
+    mtlsConfigs,
   );
-  final client = DesktopDownloader.httpClient;
+  final client = DesktopDownloader.httpClientForUrl(request.url);
   var response = http.Response(
     '',
     499,

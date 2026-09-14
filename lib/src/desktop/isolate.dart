@@ -63,11 +63,14 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
     Duration? requestTimeout,
     Map<String, dynamic> proxy,
     bool bypassTLSCertificateValidation,
+    List<MTLSConfig> mtlsConfigs,
+    String? tempFilePathConfig,
   ) = await messagesToIsolate.next;
   DesktopDownloader.setHttpClient(
     requestTimeout,
     proxy,
     bypassTLSCertificateValidation,
+    mtlsConfigs,
   );
   Logger.root.level = Level.ALL;
   Logger.root.onRecord.listen((LogRecord rec) {
@@ -120,6 +123,7 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
         resumeData,
         isResume,
         requestTimeout ?? const Duration(seconds: 60),
+        tempFilePathConfig,
         sendPort,
       ),
       UploadTask() => doUploadTask(task, sendPort),

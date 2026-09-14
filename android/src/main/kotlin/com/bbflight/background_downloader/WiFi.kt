@@ -1,12 +1,14 @@
 package com.bbflight.background_downloader
 
 import android.content.Context
+import android.util.Log
 import androidx.preference.PreferenceManager
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 
@@ -34,19 +36,48 @@ object WiFi {
         scope.launch {
             for (change in requireWiFiQueue) {
                 requireWiFiLock.lock()
-                if (!change.execute() && requireWiFiLock.isLocked) {
-                    // no re-enqueues, so unblock the requireWiFiQueue immediately
-                    requireWiFiLock.unlock()
+                try {
+                    val haveReEnqueued = change.execute()
+                    if (!haveReEnqueued && requireWiFiLock.isLocked) {
+                        // no re-enqueues, so unblock the requireWiFiQueue immediately
+                        requireWiFiLock.unlock()
+                    } else if (haveReEnqueued) {
+                        // Launch a watchdog timeout so requireWiFiLock is never permanently stuck
+                        scope.launch {
+                            delay(15000)
+                            if (requireWiFiLock.isLocked) {
+                                Log.w(BDPlugin.TAG, "WiFi re-enqueue watchdog timeout; unlocking requireWiFiLock")
+                                BDPlugin.tasksToReEnqueue.clear()
+                                try {
+                                    requireWiFiLock.unlock()
+                                } catch (_: IllegalStateException) {}
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(BDPlugin.TAG, "Exception during requireWiFiChange execution: $e")
+                    if (requireWiFiLock.isLocked) {
+                        try {
+                            requireWiFiLock.unlock()
+                        } catch (_: IllegalStateException) {}
+                    }
                 }
             }
         }
 
         scope.launch {
             for (reEnqueue in reEnqueueQueue) {
-                reEnqueue?.enqueue()
-                if (reEnqueue == null && requireWiFiLock.isLocked) {
-                    // null signals all reEnqueue items are enqueued
-                    requireWiFiLock.unlock()
+                try {
+                    reEnqueue?.enqueue()
+                } catch (e: Exception) {
+                    Log.e(BDPlugin.TAG, "Exception during WiFi reEnqueue: $e")
+                } finally {
+                    if (reEnqueue == null && requireWiFiLock.isLocked) {
+                        // null signals all reEnqueue items are enqueued
+                        try {
+                            requireWiFiLock.unlock()
+                        } catch (_: IllegalStateException) {}
+                    }
                 }
             }
         }
@@ -73,7 +104,8 @@ object WiFi {
 class RequireWiFiChange(
     private val applicationContext: Context,
     private val requireWifi: RequireWiFi,
-    private val rescheduleRunningTasks: Boolean
+    private val rescheduleRunningTasks: Boolean,
+    private val alsoRestartUploads: Boolean
 ) {
     /**
      * Execute the change in WiFi requirement and return
@@ -96,7 +128,7 @@ class RequireWiFiChange(
             if (tags.isNotEmpty()) {
                 val taskId = tags.first().substring(7)
                 val task = tasksMap[taskId]
-                if (task != null && task.isDownloadTask()) {
+                if (task != null && (task.isDownloadTask() || task.isUploadTask())) {
                     if (BDPlugin.taskRequiresWifi(task) != BDPlugin.taskIdsRequiringWiFi.contains(
                             task.taskId
                         )
@@ -120,10 +152,21 @@ class RequireWiFiChange(
                             }
 
                             WorkInfo.State.RUNNING -> {
-                                if (rescheduleRunningTasks) {
+                                if (rescheduleRunningTasks && task.isDownloadTask()) {
                                     haveReEnqueued = true
                                     BDPlugin.tasksToReEnqueue.add(task)
                                     BDPlugin.pauseTaskWithId(task.taskId)
+                                } else if (alsoRestartUploads && task.isUploadTask()) {
+                                    haveReEnqueued = true
+                                    BDPlugin.tasksToReEnqueue.add(task)
+                                    if (!BDPlugin.cancelActiveTaskWithId(
+                                            applicationContext,
+                                            task.taskId,
+                                            workManager
+                                        )
+                                    ) {
+                                        BDPlugin.tasksToReEnqueue.remove(task)
+                                    }
                                 }
                             }
 

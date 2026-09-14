@@ -10,6 +10,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import android.os.PersistableBundle
 import android.os.UserManager
 import android.util.Log
@@ -53,6 +56,7 @@ import java.net.MalformedURLException
 import java.net.URL
 import java.net.URLDecoder
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
@@ -99,6 +103,8 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             "com.bbflight.background_downloader.config.useExternalStorage"
         const val keyConfigSkipExistingFiles =
             "com.bbflight.background_downloader.config.skipExistingFiles"
+        const val keyConfigTempFilePath =
+            "com.bbflight.background_downloader.config.tempFilePath"
 
 
         @SuppressLint("StaticFieldLeak")
@@ -111,8 +117,13 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         var requireWifi = RequireWiFi.asSetByTask // global setting
         val localResumeData =
             Collections.synchronizedMap(mutableMapOf<String, ResumeData>()) // by taskId, for pause notifications
-        var cancelUpdateSentForTaskId =
-            Collections.synchronizedMap(mutableMapOf<String, Long>()) // <taskId, timeMillis>
+        // ConcurrentHashMap (not synchronizedMap): canSendCancellation prunes stale
+        // entries by iterating this map, and synchronizedMap does not synchronize
+        // iteration, which raced with concurrent status-update processing and threw
+        // ConcurrentModificationException. ConcurrentHashMap's iterators are
+        // weakly-consistent and never throw CME.
+        val cancelUpdateSentForTaskId =
+            ConcurrentHashMap<String, Long>() // <taskId, timeMillis>
         val pausedTaskIds =
             Collections.synchronizedSet(mutableSetOf<String>()) // <taskId>, acts as flag
         val canceledTaskIds =
@@ -143,6 +154,14 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             initialDelayMillis: Long = 0,
             plugin: BDPlugin? = null
         ): Boolean {
+            val expedited = task.priority < 5 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+            val actualDelayMillis = if (initialDelayMillis > 0 && expedited) {
+                kotlinx.coroutines.delay(initialDelayMillis)
+                0L
+            } else {
+                initialDelayMillis
+            }
+
             Log.i(TAG, "Enqueuing task with id ${task.taskId}")
             // store backgroundChannel to be used by this task
             val bgChannel = backgroundChannel(plugin)
@@ -163,56 +182,67 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             // UIDT (JobScheduler) is used only if task priority is 0 (max priority)
             // and notificationConfigJsonString is set (required for foreground)
             // and API level is >= 34 (Upside Down Cake)
-            val useJobScheduler = task.priority == 0 && 
+            var useJobScheduler = task.priority == 0 &&
                                   notificationConfigJsonString != null && 
                                   Build.VERSION.SDK_INT >= 34
+            if (useJobScheduler) {
+                // UIDT requires the RUN_USER_INITIATED_JOBS permission. If not granted, fallback to WorkManager.
+                val permissionStatus = ContextCompat.checkSelfPermission(context, Manifest.permission.RUN_USER_INITIATED_JOBS)
+                if (permissionStatus != PackageManager.PERMISSION_GRANTED) {
+                    Log.w(TAG, "RUN_USER_INITIATED_JOBS permission not granted, falling back to WorkManager for task ${task.taskId}")
+                    useJobScheduler = false
+                }
+            }
 
             val taskRequiresWifi = taskRequiresWifi(task)
             if (taskRequiresWifi) {
                 taskIdsRequiringWiFi.add(task.taskId)
             }
 
-            val success: Boolean
+            var success = false
             if (useJobScheduler) {
-                val jobScheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-                val componentName = ComponentName(context, UIDTJobService::class.java)
-                val extras = PersistableBundle().apply {
-                    putString(TaskWorker.keyTask, taskToJsonString(task))
-                    if (notificationConfigJsonString != null) {
-                        putString(TaskWorker.keyNotificationConfig, notificationConfigJsonString)
+                try {
+                    val jobScheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+                    val componentName = ComponentName(context, UIDTJobService::class.java)
+                    val extras = PersistableBundle().apply {
+                        putString(TaskWorker.keyTask, taskToJsonString(task))
+                        if (notificationConfigJsonString != null) {
+                            putString(TaskWorker.keyNotificationConfig, notificationConfigJsonString)
+                        }
+                        if (resumeData != null) {
+                            putString(TaskWorker.keyResumeDataData, resumeData.data)
+                            putLong(TaskWorker.keyStartByte, resumeData.requiredStartByte)
+                            putString(TaskWorker.keyETag, resumeData.eTag)
+                        }
                     }
-                    if (resumeData != null) {
-                        putString(TaskWorker.keyResumeDataData, resumeData.data)
-                        putLong(TaskWorker.keyStartByte, resumeData.requiredStartByte)
-                        putString(TaskWorker.keyETag, resumeData.eTag)
+                    
+                    val jobInfoBuilder = JobInfo.Builder(task.taskId.hashCode(), componentName)
+                        .setRequiredNetworkType(if (taskRequiresWifi) JobInfo.NETWORK_TYPE_UNMETERED else JobInfo.NETWORK_TYPE_ANY)
+                        .setRequiresCharging(false)
+                        .setExtras(extras)
+                    
+                    if (Build.VERSION.SDK_INT >= 34) {
+                        jobInfoBuilder.setUserInitiated(true)
+                        // Provide a default estimate if actual size is unknown to help OS scheduling
+                        jobInfoBuilder.setEstimatedNetworkBytes(1024L * 1024L * 10L, JobInfo.NETWORK_BYTES_UNKNOWN.toLong())
                     }
+
+                    if (actualDelayMillis > 0L && Build.VERSION.SDK_INT < 34) {
+                        jobInfoBuilder.setMinimumLatency(actualDelayMillis)
+                    }
+                    
+                    val result = jobScheduler.schedule(jobInfoBuilder.build())
+                    success = (result == JobScheduler.RESULT_SUCCESS)
+                    if (!success) {
+                        Log.w(TAG, "Unable to schedule JobScheduler job for taskId ${task.taskId}, falling back to WorkManager")
+                        useJobScheduler = false
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Exception scheduling JobScheduler job for taskId ${task.taskId}, falling back to WorkManager", e)
+                    useJobScheduler = false
                 }
-                
-                val jobInfoBuilder = JobInfo.Builder(task.taskId.hashCode(), componentName)
-                    .setRequiredNetworkType(if (taskRequiresWifi) JobInfo.NETWORK_TYPE_UNMETERED else JobInfo.NETWORK_TYPE_ANY)
-                    .setRequiresCharging(false)
-                    .setExtras(extras)
-                
-                if (initialDelayMillis > 0) {
-                    jobInfoBuilder.setMinimumLatency(initialDelayMillis)
-                }
-                // JobScheduler will persist tasks across reboots if strictly necessary, 
-                // but WorkManager handles this better. 
-                // However user requested UIDT which implies immediate execution mostly.
-                // We set persisted to true? JobInfo.Builder.setPersisted(true) requires RECEIVE_BOOT_COMPLETED.
-                // WorkManager handles persistence. JobScheduler needs manual handling?
-                // UIDT is mostly for immediate user-initiated transfers.
-                // Let's set persisted to true if we can, but we need the permission.
-                // For now, default to false (not persisted across reboot) unless we add permission.
-                // background_downloader typically expects persistence?
-                // JobScheduler jobs are not persisted by default.
-                
-                val result = jobScheduler.schedule(jobInfoBuilder.build())
-                success = (result == JobScheduler.RESULT_SUCCESS)
-                if (!success) {
-                    Log.w(TAG, "Unable to schedule JobScheduler job for taskId ${task.taskId}")
-                }
-            } else {
+            }
+            if (!useJobScheduler) {
                 // Use WorkManager
                 val dataBuilder = Data.Builder().putString(TaskWorker.keyTask, taskToJsonString(task))
                 if (notificationConfigJsonString != null) {
@@ -234,10 +264,10 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 ).build()
                 val requestBuilder: OneTimeWorkRequest.Builder =
                     createRequestBuilder(task, data, constraints) ?: return false
-                if (initialDelayMillis != 0L) {
-                    requestBuilder.setInitialDelay(initialDelayMillis, TimeUnit.MILLISECONDS)
+                if (actualDelayMillis != 0L) {
+                    requestBuilder.setInitialDelay(actualDelayMillis, TimeUnit.MILLISECONDS)
                 }
-                val expedited = task.priority < 5 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+
                 if (expedited) {
                     requestBuilder.setExpedited(policy = OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 }
@@ -245,14 +275,14 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 success = try {
                     val operation = try {
                         workManager.enqueue(requestBuilder.build())
-                    } catch (e: IllegalStateException) {
+                    } catch (e: Exception) {
                          if (expedited) {
                              Log.i(TAG, "Could not enqueue expedited task, falling back to non-expedited")
                              val nonExpeditedRequestBuilder =
                                  createRequestBuilder(task, data, constraints) ?: throw e
-                             if (initialDelayMillis != 0L) {
+                             if (actualDelayMillis != 0L) {
                                  nonExpeditedRequestBuilder.setInitialDelay(
-                                     initialDelayMillis,
+                                     actualDelayMillis,
                                      TimeUnit.MILLISECONDS
                                  )
                              }
@@ -694,6 +724,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     "configUseExternalStorage" -> methodConfigUseExternalStorage(call)
                     "configHoldingQueue" -> methodConfigHoldingQueue(call)
                     "configSkipExistingFiles" -> methodConfigSkipExistingFiles(call)
+                    "configTempFilePath" -> methodConfigTempFilePath(call)
                     "platformVersion" -> methodPlatformVersion()
                     "forceFailPostOnBackgroundChannel" -> methodForceFailPostOnBackgroundChannel(
                         call
@@ -1031,6 +1062,16 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         return null
     }
 
+    /**
+     * Store the tempFilePath config in shared preferences
+     */
+    private suspend fun methodConfigTempFilePath(call: MethodCall): Any? {
+        withContext(defaultScope.coroutineContext) {
+            updateSharedPreferences(keyConfigTempFilePath, call.arguments as String?)
+        }
+        return null
+    }
+
     /** Returns Task for this taskId, or nil */
     private suspend fun methodTaskForId(call: MethodCall): String? =
         withContext(defaultScope.coroutineContext) {
@@ -1256,11 +1297,13 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         val args = call.arguments as List<*>
         val newRequireWiFi = RequireWiFi.entries[args[0] as Int]
         val rescheduleRunning = args[1] as Boolean
+        val alsoRestartUploads = args[2] as Boolean
         WiFi.requireWiFiChange(
             RequireWiFiChange(
                 applicationContext,
                 newRequireWiFi,
-                rescheduleRunning
+                rescheduleRunning,
+                alsoRestartUploads
             )
         )
         true
@@ -1565,6 +1608,25 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         }
         Log.d(TAG, "Setting preference key $key to $value")
     }
+
+
+    /**
+     * Helper function to update or delete the [value] String in shared preferences under [key]
+     *
+     * If [value] is null, the [key] is deleted
+     */
+    private fun updateSharedPreferences(key: String, value: String?) {
+        PreferenceManager.getDefaultSharedPreferences(applicationContext).edit().apply {
+            if (value != null) {
+                putString(key, value)
+            } else {
+                remove(key)
+            }
+            apply()
+        }
+        Log.d(TAG, "Setting preference key $key to $value")
+    }
+
 
     /**
      * Store the skipExistingFiles config in shared preferences

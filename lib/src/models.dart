@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'exceptions.dart';
 import 'task.dart';
 
+export 'options/mtls.dart';
+
 /// Defines a set of possible states which a [Task] can be in.
 enum TaskStatus {
   /// Task is enqueued on the native platform and waiting to start
@@ -624,6 +626,9 @@ final class Config {
   static const bypassTLSCertificateValidation =
       'bypassTLSCertificateValidation';
 
+  /// Config string for mutual TLS (mTLS)
+  static const mTLS = 'mTLS';
+
   /// Config string for run in foreground
   static const runInForeground = 'runInForeground';
 
@@ -648,6 +653,9 @@ final class Config {
 
   /// Config string for skip existing files
   static const skipExistingFiles = 'skipExistingFiles';
+
+  /// Config string for temp file path
+  static const tempFilePath = 'tempFilePath';
 
   // Config arguments
 

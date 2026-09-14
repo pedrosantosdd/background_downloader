@@ -27,6 +27,7 @@ Future<void> doDownloadTask(
   ResumeData? resumeData,
   bool isResume,
   Duration requestTimeout,
+  String? tempFilePathConfig,
   SendPort sendPort,
 ) async {
   // use downloadTask from here on as a 'global' variable in this isolate,
@@ -39,7 +40,7 @@ Future<void> doDownloadTask(
       isResume && resumeData != null
           ? resumeData.tempFilepath
           : p.join(
-            (await getTemporaryDirectory()).path,
+            tempFilePathConfig ?? (await getTemporaryDirectory()).path,
             'com.bbflight.background_downloader${Random().nextInt(1 << 32).toString()}',
           );
   final requiredStartByte =
@@ -48,7 +49,7 @@ Future<void> doDownloadTask(
   isResume =
       isResume &&
       await determineIfResumeIsPossible(tempFilePath, requiredStartByte);
-  final client = DesktopDownloader.httpClient;
+  final client = DesktopDownloader.httpClientForUrl(downloadTask.url);
   var request = http.Request(
     downloadTask.httpRequestMethod,
     Uri.parse(downloadTask.url),
@@ -261,7 +262,7 @@ Future<TaskStatus> processOkDownloadResponse(
       } catch (_) {}
       if (resultStatus == TaskStatus.failed &&
           serverAcceptsRanges &&
-          bytesTotal + startByte > 1 << 20) {
+          (bytesTotal + startByte > 1 << 20 || isResume)) {
         // send ResumeData to allow resume after fail
         sendPort.send((
           'resumeData',

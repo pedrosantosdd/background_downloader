@@ -1,3 +1,44 @@
+## 9.5.9
+
+* Add `Config.mTLS` and `MTLSConfig` data class to support mutual TLS client authentication on desktop platforms (closes #711)
+* Add `Config.tempFilePath` to allow configuring a custom temporary directory path for downloads (closes #712)
+* Reduce default task timeout for expedited tasks to 2 minutes
+* [Android] Bug fixes and stability improvements:
+  - Fixes WorkManager crash when enqueuing expedited tasks with initial delays (fixes #709)
+  - Properly configures Android 14+ UIDT JobInfo and adds fallback to WorkManager (fixes #710)
+  - Improves UIDT JobService stop detection, reschedule contract, and notification policy
+  - Fixes thread safety and memory leaks in `HoldingQueue` and batch-drains available concurrency slots
+  - Eliminates deadlock risk in WiFi requirement lock with watchdog timeout
+  - Resolves coroutine hang in `Callbacks` when callback handle is missing or invalid
+  - Adds copy+delete fallback for cross-device moves in `DownloadTaskRunner`
+  - Prevents `InputStream` resource leaks in `UploadTaskRunner`
+  - Deletes incomplete MediaStore entry upon `moveToSharedStorage` failure
+  - Cleans up partial multipart file if creation fails in `UploadTaskRunner`
+* [iOS] Bug fixes and stability improvements:
+  - Prevents `stateLock` contention during network I/O in `HoldingQueue` and batch-drains concurrency slots
+  - Prevents `pauseSingleTask` race condition and stalled task state
+  - Synchronizes access to `uploaderForUrlSessionTaskIdentifier`
+* [Desktop] Temp file handling improvements:
+  - Ensures temporary download files are cleaned up upon completion of resumed downloads
+  - Preserves partial download temp files on resume failures for subsequent retries
+* [Documentation] Clarifies single-subscription nature of `FileDownloader.updates` stream (fixes #708)
+
+## 9.5.8
+
+* Add `alsoRestartUploads` parameter to `FileDownloader.requireWiFi` to optionally cancel and restart running upload tasks when updating WiFi requirement (fixes #695)
+* [iOS] Fixes typo in `PrivacyInfo.xcprivacy` for photos and videos data collection key (`NSPrivacyCollectedDataTypePhotosorVideos`), resolving App Store submission validation errors (fixes #694)
+* [Documentation] Adds comprehensive documentation for `TaskStatusUpdate` and `TaskProgressUpdate` in `doc/status_updates.md` (fixes #684)
+
+## 9.5.7
+
+* [Android] Bug fixes:
+  - Fixes group notification sticking in running state when cancelling tasks from holding queue
+  - Fixes `ConcurrentModificationException` in `canSendCancellation` when processing concurrent status updates
+* [iOS] Bug fixes:
+  - Fixes group notification sticking in running state when cancelling tasks from holding queue
+  - Serializes access to group notification registry to prevent `EXC_BAD_ACCESS` race condition under concurrent status updates
+* [General] Defer `JsonProcessor` idle shutdown while requests are pending to prevent unexpected background isolate shutdown errors
+
 ## 9.5.6
 
 * [Android] Bug fixes and build improvements:
